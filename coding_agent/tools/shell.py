@@ -1,15 +1,17 @@
 """Shell execution tool."""
 from __future__ import annotations
 
+import locale
 import os
 import re
+import signal
 import subprocess
 from typing import Optional
 
 from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool
 
-from .filesystem import _cfg, _root
+from .filesystem import _cfg, _root, _within
 
 
 # ------------------------------------------------------------------ guard ---
@@ -36,6 +38,12 @@ _DANGEROUS_PATTERNS: list[tuple[str, str]] = [
     (r"\b(?:Stop-Computer|Restart-Computer|shutdown\.exe)\b", "shutdown / reboot (Windows)"),
     # privilege escalation
     (r"\bsudo\b", "privilege escalation (sudo)"),
+    # wildcard / system-directory recursive deletes
+    (r"\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?/\*", "recursive delete of '/*'"),
+    (r"\b(?:Remove-Item|rm|ri)\b[^\n]*-r(?:ecurse)?\b[^\n]*[A-Za-z]:\\(?:Windows|Users|Program Files(?: \(x86\))?|ProgramData)(?:\\\*?)?[\"']?(?:\s|$)", "recursive delete of a Windows system/users directory"),
+    (r"\b(?:rmdir|rd|del|erase)\b[^\n]*/[sS]\b[^\n]*[A-Za-z]:\\(?:Windows|Users|Program Files(?: \(x86\))?|ProgramData)(?:\\\*?)?[\"']?(?:\s|$)", "recursive delete of a Windows system/users directory"),
+    # discards ALL untracked/ignored files in the repo
+    (r"\bgit\s+clean\b[^\n]*\s-[a-z]*f", "git clean -f (deletes untracked files)"),
     # fork bomb
     (r":\s*\(\)\s*\{\s*:\s*\|:\s*&\s*\}\s*;?\s*:", "fork bomb"),
     # remote script piped into a shell
@@ -51,6 +59,91 @@ def _dangerous_reason(command: str) -> str | None:
         if pattern.search(command):
             return label
     return None
+
+
+_MAX_TIMEOUT = 600
+
+# Make Windows PowerShell 5.1 emit UTF-8 (default is the OEM code page).
+_PS_UTF8_PREFIX = (
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+    "$OutputEncoding=[Console]::OutputEncoding;"
+)
+
+_SECRET_NAME_PARTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH",
+                      "COOKIE", "CONNECTIONSTRING", "PRIVATE")
+_SECRET_NAMES = {"PAT", "DATABASE_URL", "SAS_URL"}
+_SECRET_PREFIXES = ("AZURE_", "DEEPSEEK_", "OPENAI_", "ANTHROPIC_", "GITHUB_", "GH_", "CODING_AGENT_")
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for the child shell with obvious secrets removed."""
+    env = {}
+    for k, v in os.environ.items():
+        ku = k.upper()
+        if ku in _SECRET_NAMES or ku.startswith(_SECRET_PREFIXES) or any(part in ku for part in _SECRET_NAME_PARTS):
+            continue
+        env[k] = v
+    return env
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and all of its descendants."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=15,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _decode(data: Optional[bytes]) -> str:
+    """Decode child output: UTF-8 first, then the locale code page (lossy only here)."""
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+
+
+def _cap_output(out: str, limit: int) -> str:
+    """Head+tail truncation on whole lines, stating what was kept."""
+    if len(out) <= limit:
+        return out
+    lines = out.split("\n")
+    head_budget = int(limit * 0.7)
+    tail_budget = limit - head_budget
+    head: list[str] = []
+    used = 0
+    for ln in lines:
+        if used + len(ln) + 1 > head_budget:
+            break
+        head.append(ln)
+        used += len(ln) + 1
+    tail: list[str] = []
+    used = 0
+    for ln in reversed(lines[len(head):]):
+        if used + len(ln) + 1 > tail_budget:
+            break
+        tail.append(ln)
+        used += len(ln) + 1
+    tail.reverse()
+    if not head and not tail:  # one giant line: fall back to a char cut
+        return out[:head_budget] + f"\n...[truncated, {len(out) - limit:,} chars omitted]...\n" + out[-tail_budget:]
+    skipped = len(lines) - len(head) - len(tail)
+    marker = (
+        f"...[output truncated: kept first {len(head)} and last {len(tail)} of {len(lines)} lines; "
+        f"{skipped} lines / {len(out) - sum(map(len, head)) - sum(map(len, tail)):,} chars omitted]..."
+    )
+    return "\n".join(head + [marker] + tail)
 
 
 @tool
@@ -73,40 +166,51 @@ def run_shell(
             )
     root = _root(config)
     cwd = (root / workdir).resolve()
-    if not cwd.exists():
+    if not _within(root, cwd):
+        return f"Error: workdir escapes project root: {workdir}"
+    if not cwd.is_dir():
         return f"Error: workdir does not exist: {workdir}"
-    t = timeout or int(_cfg(config).get("shell_timeout", 120))
+    t = timeout if timeout and timeout > 0 else int(_cfg(config).get("shell_timeout", 120))
+    t = min(t, _MAX_TIMEOUT)
     if os.name == "nt":
-        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
+        cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_UTF8_PREFIX + command]
+        popen_kw: dict = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     else:
         cmd = ["bash", "-lc", command]
+        popen_kw = {"start_new_session": True}
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",  # Windows consoles often use gbk; force UTF-8
-            errors="replace",
-            timeout=t,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_child_env(),
+            **popen_kw,
         )
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {t}s:\n$ {command}"
+    except OSError as e:
+        return f"Error: could not start shell: {e}"
+    timed_out = False
+    try:
+        out_b, err_b = proc.communicate(timeout=t)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        _kill_tree(proc)
+        out_b, err_b = exc.stdout, exc.stderr
+        try:  # collect whatever the dead tree left in the pipes; never wait long
+            out_b, err_b = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass  # a detached grandchild still holds the pipes; keep what we have
+    stdout, stderr = _decode(out_b), _decode(err_b)
     parts = []
-    if proc.stdout:
-        parts.append(proc.stdout.strip())
-    if proc.stderr:
-        parts.append("[stderr]\n" + proc.stderr.strip())
-    out = "\n".join(parts)
-    limit = int(_cfg(config).get("tool_output_limit", 20_000))
-    if len(out) > limit:
-        head = int(limit * 0.7)
-        tail = limit - head
-        omitted = len(out) - limit
-        out = (
-            out[:head]
-            + f"\n...[truncated, {omitted:,} chars omitted]...\n"
-            + out[-tail:]
+    if stdout:
+        parts.append(stdout.strip())
+    if stderr:
+        parts.append("[stderr]\n" + stderr.strip())
+    out = _cap_output("\n".join(parts), int(_cfg(config).get("tool_output_limit", 12_000)))
+    if timed_out:
+        return f"Error: command timed out after {t}s (process tree killed):\n$ {command}" + (
+            f"\n[partial output]\n{out}" if out else ""
         )
     if not out:
         return f"$ {command}\n(exit code {proc.returncode}, no output)"

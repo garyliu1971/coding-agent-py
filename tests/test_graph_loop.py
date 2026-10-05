@@ -46,7 +46,7 @@ class FakeLLM:
     def __init__(self, script):
         self._script = script
 
-    def bind_tools(self, tools):
+    def bind_tools(self, tools, **kwargs):
         return FakeBound(self._script)
 
 
@@ -61,7 +61,7 @@ class RecordingBound(FakeBound):
 
 
 class RecordingFakeLLM(FakeLLM):
-    def bind_tools(self, tools):
+    def bind_tools(self, tools, **kwargs):
         return RecordingBound(self._script)
 
 
@@ -142,7 +142,7 @@ def main() -> int:
     # Re-run with a bound object that records inputs to verify the warning is injected.
     rec = RecordingFakeLLM(loop_script)
     bound_obj = rec.bind_tools([])
-    rec.bind_tools = lambda tools: bound_obj  # ensure the same instance is reused
+    rec.bind_tools = lambda tools, **kw: bound_obj  # ensure the same instance is reused
     graph4 = build_graph(cfg, rec)
     graph4.invoke(state, config={**config, "recursion_limit": 30})
     saw_warning = any(
@@ -165,7 +165,7 @@ def main() -> int:
     ]
     rec2 = RecordingFakeLLM(stall_script)
     bound2 = rec2.bind_tools([])
-    rec2.bind_tools = lambda tools: bound2
+    rec2.bind_tools = lambda tools, **kw: bound2
     graph5 = build_graph(cfg, rec2)
     final5 = graph5.invoke(state, config={**config, "recursion_limit": 30})
     check("stall run still finishes", final5.get("finished") is True)

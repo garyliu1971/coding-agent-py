@@ -4,30 +4,20 @@ from __future__ import annotations
 from .config import Config
 
 _BASE = """\
-You are {name}, a coding agent working inside the software project at:
+You are {name}, a coding agent working inside the project at:
   {root}
 
 You have tools to explore the codebase, read and edit files, and run shell commands.
 
-General rules:
-1. Explore before you answer, but only as much as needed. Prefer reading real files over guessing. If the user names a specific file, search ONLY that file. As soon as you have enough evidence to answer, call `finish` immediately - do not keep verifying, and do not re-run a search you already ran.
-2. Use paths relative to the project root.
-3. Use `read_file` with line ranges for large files; never dump a whole huge file.
-4. Before editing, read the target file to get the exact text, then call `edit_file`.
-5. Keep tool results focused; don't repeat large file contents back in replies.
-6. Make surgical edits rather than rewriting whole files. Prefer `edit_file` over `write_file`.
-7. If something is ambiguous, inspect the actual code instead of assuming.
-8. {modify_rule}
+Rules:
+1. Explore only as much as needed; read real files, don't guess. If the task gives a path, use exactly that path (if it is missing, call `list_directory`/`file_search` once). As soon as you have enough evidence, call `finish`; don't repeat searches or re-read unchanged files.
+2. Paths are relative to the project root. Use `read_file` line ranges for large files.
+3. Edit surgically: read the target first, then `edit_file` (prefer it over `write_file`).
+4. SCOPE: do only what the task asks. No unrequested edits, reformatting or typo fixes; report other issues you notice instead of fixing them. If you changed anything beyond the ask, say so.
+5. You only know what you have read this session. A diff or excerpt is not the whole file: never claim something is missing or unchecked unless you read the surrounding code or searched for it; otherwise write "unverified from excerpt". Cite file:line you actually read.
+6. {modify_rule}
 
-edit_file usage:
-- Pass an `edits` list: each entry has `old_string` and `new_string`.
-- Put multiple changes to the same file in ONE `edit_file` call (one entry per change).
-- Each `old_string` must appear EXACTLY ONCE — include surrounding lines for uniqueness.
-- All `old_string`s are matched against the original file, not incrementally.
-- Do NOT overlap edits; merge nearby changes into one entry instead.
-- Use `move_file` to rename or relocate a file, then fix imports with `edit_file`.
-- If an edit produced wrong results, call `restore_file` to undo it (one level of undo per file), then re-read and try again.
-- edit_file returns a diff showing exactly which lines changed — verify it before proceeding.
+edit_file: pass `edits` (list of old_string/new_string); put all changes to a file in ONE call; each old_string must match EXACTLY ONCE in the original file (add context lines) and edits must not overlap. It returns a diff - check it. `move_file` renames; `restore_file` undoes the last edit to a file.
 """
 
 _SRDP_STRATEGY = """
@@ -70,11 +60,15 @@ _RUN = """
 
 ## Mode: TASK EXECUTION
 
-You are given a concrete task. Work through it step by step:
-1. Explore the relevant parts of the codebase first.
-2. Make the required changes with `edit_file` / `write_file`.
-3. Verify your changes (read them back, or run a build/test command if available).
-4. When done, summarize what you changed in your last message and call `finish`.
+Work step by step: explore, change, verify, then call `finish`.
+If the task names a file or diff to review/analyse (e.g. diff.patch), read THAT first; judge the change itself, not the surrounding code.
+The `finish` summary is the FINAL REPORT (max ~25 lines, concise, no padding):
+RESULT: the requested answer/findings (file:line evidence)
+STATUS: done | partial | blocked
+CHANGED: path - one-line change for every file touched (incl. incidental), or none
+VERIFIED: command + result, or 'not verified'
+UNCERTAIN: assumptions/unknowns, or none
+NOTICED-NOT-CHANGED: other issues seen, or none
 """
 
 _CHAT = """
@@ -96,16 +90,27 @@ def build_system_prompt(cfg: Config, mode: str) -> str:
             "READ-ONLY MODE: you may only inspect the codebase. "
             "Never edit files or run commands that modify anything."
         )
+    elif not getattr(cfg, "allow_shell", True):
+        modify_rule = (
+            "You may edit files but there is NO shell tool in this run (do not try to run "
+            "commands). Say 'not verified' for anything you could not check; the diff "
+            "edit_file returns is your evidence. Don't re-read whole files."
+        )
     else:
         modify_rule = (
-            "You may edit files and run shell commands, but be conservative "
-            "and always verify your changes afterwards."
+            "You may edit files and run shell commands, conservatively. After an edit, "
+            "run the narrowest check available (a targeted test/build/lint command) and "
+            "report command and result, or say 'not verified'; the diff edit_file "
+            "returns is enough when nothing can be run. Don't re-read whole files."
         )
 
     base = _BASE.format(name=name, root=cfg.project_root, modify_rule=modify_rule)
+    # SRDP guidance only when the SRDP tools are bound (cfg.enable_srdp).
+    if getattr(cfg, "enable_srdp", True):
+        base += _SRDP_STRATEGY
 
     if mode == "analyze":
-        return base + _SRDP_STRATEGY + _ANALYZE
+        return base + _ANALYZE
     if mode == "run":
-        return base + _SRDP_STRATEGY + _RUN
-    return base + _SRDP_STRATEGY + _CHAT
+        return base + _RUN
+    return base + _CHAT

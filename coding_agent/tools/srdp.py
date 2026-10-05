@@ -32,6 +32,22 @@ from langchain_core.tools import tool
 
 from .filesystem import _cfg, _root, _within
 
+# Zip-bomb guard: no single entry may inflate beyond this many bytes in memory.
+_MAX_ENTRY_BYTES = 256 * 1024 * 1024
+
+
+class EntryTooLarge(ValueError):
+    pass
+
+
+def _read_capped(zf: zipfile.ZipFile, name, limit: int = _MAX_ENTRY_BYTES) -> bytes:
+    """``zf.read(name)`` that refuses entries inflating past ``limit`` (declared sizes can lie)."""
+    with zf.open(name) as fh:
+        data = fh.read(limit + 1)
+    if len(data) > limit:
+        raise EntryTooLarge(f"zip entry {getattr(name, 'filename', name)} is larger than {limit // (1024 * 1024)} MB uncompressed; refusing to read it")
+    return data
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -54,13 +70,13 @@ def _resolve_srdp(root: Path, srdp_path: str) -> tuple[Path, str]:
     return p, srdp_path
 
 
-def _cap_text(text: str, limit: int = 60_000) -> str:
+def _cap_text(text: str, limit: int = 20_000) -> str:
     if len(text) > limit:
         return text[:limit] + f"\n...[truncated {len(text)-limit:,} chars]"
     return text
 
 
-def _read_entry_text(data: bytes, name: str, limit: int = 60_000) -> str:
+def _read_entry_text(data: bytes, name: str, limit: int = 20_000) -> str:
     """Decode bytes as UTF-8 text."""
     text = data.decode("utf-8", errors="replace")
     return _cap_text(text, limit)
@@ -118,7 +134,7 @@ def srdp_list(
                 # If it's a .bin, try to peek inside as a nested zip
                 if ext == ".bin" and size > 0:
                     try:
-                        raw = zf.read(info.filename)
+                        raw = _read_capped(zf, info.filename)
                         with zipfile.ZipFile(io.BytesIO(raw)) as inner:
                             inner_entries = inner.infolist()
                             lines.append(f"    └─ nested zip ({len(inner_entries)} entries):")
@@ -170,7 +186,7 @@ def srdp_read(
         return f"Error: file not found: {srdp_path}"
 
     cfg = _cfg(config)
-    limit = int(cfg.get("file_read_limit", 60_000))
+    limit = int(cfg.get("file_read_limit", 20_000))
 
     try:
         with zipfile.ZipFile(str(p)) as zf:
@@ -181,7 +197,7 @@ def srdp_read(
                 hint = f"  Did you mean: {close[:5]}" if close else ""
                 return f"Error: entry '{entry}' not found in {display}.{hint}\nUse srdp_list to see all entries."
 
-            raw = zf.read(entry)
+            raw = _read_capped(zf, entry)
             ext = Path(entry).suffix.lower()
 
             # --- Case 1: top-level text file ---
@@ -221,7 +237,7 @@ def srdp_read(
                                 f"Error: inner entry '{inner_entry}' not found in {entry}.{hint}\n"
                                 "Call srdp_read without inner_entry to list the nested zip."
                             )
-                        inner_raw = inner.read(inner_entry)
+                        inner_raw = _read_capped(inner, inner_entry)
                         if _is_text(inner_entry):
                             return (
                                 f"=== {display} / {entry} / {inner_entry} "
@@ -270,7 +286,7 @@ def srdp_read(
                                 f"Error: inner entry '{inner_entry}' not found.{hint}\n"
                                 "Call without inner_entry to list contents."
                             )
-                        inner_raw = inner.read(inner_entry)
+                        inner_raw = _read_capped(inner, inner_entry)
                         if _is_text(inner_entry):
                             return (
                                 f"=== {display} / {entry} / {inner_entry} "
@@ -344,13 +360,13 @@ def _grep_zip(
 
         if ext in _GREP_TEXT_EXTENSIONS:
             try:
-                raw = zf.read(name)
+                raw = _read_capped(zf, name)
                 _grep_in_bytes(raw, keyword, case_sensitive, full_path, results, cap)
             except Exception:
                 pass
         elif ext in _GREP_ZIP_EXTENSIONS or ext == ".bin":
             try:
-                raw = zf.read(name)
+                raw = _read_capped(zf, name)
                 with zipfile.ZipFile(io.BytesIO(raw)) as inner:
                     _grep_zip(inner, keyword, case_sensitive, f"{full_path}!/", results, cap)
             except Exception:

@@ -153,6 +153,95 @@ def find_cut_index(messages: list[AnyMessage], keep_chars: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# old tool-result stubbing (LLM-only view; graph state is never modified)
+# ---------------------------------------------------------------------------
+
+_STUB_SKIP_ARGS = {"content", "new_string", "old_string", "edits"}
+_STUB_MIN_CHARS = 300  # results shorter than this are not worth stubbing
+
+
+def _is_image_tool_message(m: ToolMessage) -> bool:
+    c = m.content
+    if isinstance(c, dict):
+        return c.get("type") == "image_url"
+    if isinstance(c, str) and c.startswith("{"):
+        try:
+            j = json.loads(c)
+            return isinstance(j, dict) and j.get("type") == "image_url"
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _stub_text(m: ToolMessage, call: dict | None) -> str:
+    name = getattr(m, "name", None) or (call or {}).get("name") or "tool"
+    args = (call or {}).get("args") or {}
+    parts = []
+    for k in sorted(args):
+        if k in _STUB_SKIP_ARGS:
+            continue
+        parts.append(f"{k}={repr(args[k])[:60]}")
+        if len(parts) >= 4:
+            break
+    return (
+        f"[stub] {name}({', '.join(parts)}) -> {len(m.content)} chars omitted; "
+        "re-read if needed"
+    )
+
+
+def stub_old_tool_results(
+    messages: list[AnyMessage],
+    keep_rounds: int = 4,
+    batch_rounds: int = 4,
+) -> list[AnyMessage]:
+    """Return a view of ``messages`` with old ToolMessage contents stubbed.
+
+    A "round" is one AIMessage.  ToolMessages belonging to rounds older than the
+    last ``keep_rounds`` are replaced by a deterministic one-line stub (tool name,
+    key args, original size, "re-read if needed").
+
+    Cache note: the stub boundary only advances in steps of ``batch_rounds``
+    (stubbed rounds = floor((rounds - keep_rounds) / batch_rounds) * batch_rounds),
+    so between advances every leading message is byte-identical and the provider
+    prompt-cache prefix stays valid; sliding every turn would invalidate it each turn.
+
+    Image-carrying results, short results and the ``finish`` result are left
+    alone.  Input messages are never mutated; stubbed ones are new objects.
+    """
+    if keep_rounds <= 0:
+        return list(messages)
+    batch = max(1, batch_rounds)
+    ai_idx = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
+    stub_rounds = ((len(ai_idx) - keep_rounds) // batch) * batch
+    if stub_rounds <= 0:
+        return list(messages)
+    boundary = ai_idx[stub_rounds]  # everything before this index is "old"
+
+    calls: dict[str, dict] = {}
+    for m in messages[:boundary]:
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls or []:
+                if tc.get("id"):
+                    calls[tc["id"]] = tc
+
+    out: list[AnyMessage] = []
+    for i, m in enumerate(messages):
+        if (
+            i < boundary
+            and isinstance(m, ToolMessage)
+            and isinstance(m.content, str)
+            and len(m.content) > _STUB_MIN_CHARS
+            and getattr(m, "name", None) != "finish"
+            and not _is_image_tool_message(m)
+        ):
+            text = _stub_text(m, calls.get(m.tool_call_id))
+            if len(text) < len(m.content):
+                m = ToolMessage(content=text, name=getattr(m, "name", None), tool_call_id=m.tool_call_id)
+        out.append(m)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # serialisation (for the summary prompt)
 # ---------------------------------------------------------------------------
 
@@ -289,10 +378,12 @@ def _replace_old_images(to_keep: list[AnyMessage], keep_recent_images: int) -> l
     return to_keep
 
 
+DEFAULT_SUMMARY_MAX_CHARS = 3_000
+
 _SUMMARY_PROMPT = textwrap.dedent("""\
     You are summarising a coding-agent conversation for context compression.
     The agent is working on a software project. Below is the conversation history
-    to summarise. Write a concise but complete summary covering:
+    to summarise. Write a concise summary covering:
 
     - The overall task / goal
     - Key findings from code exploration (important files, architecture, patterns)
@@ -303,26 +394,62 @@ _SUMMARY_PROMPT = textwrap.dedent("""\
 
     Be specific about file paths and code details — the agent will use this
     summary to continue its work without re-reading already-explored files.
+    HARD LIMIT: at most ~{max_words} words. {prior_note}
     Do NOT include meta-commentary. Write only the summary content.
-
+    {prior_block}
     CONVERSATION:
     {transcript}
 """)
 
 
-def _generate_summary(to_summarise: list[AnyMessage], llm) -> str:
-    """Call the LLM once to summarise ``to_summarise``; fall back gracefully."""
+def _clip_summary(text: str, max_chars: int) -> str:
+    if max_chars and len(text) > max_chars:
+        return text[:max_chars].rstrip() + "…[summary truncated]"
+    return text
+
+
+def _report_usage(response, usage_cb) -> None:
+    """Report a summarisation call to ``usage_cb(usage_metadata_or_None)``."""
+    if usage_cb is None:
+        return
+    try:
+        usage_cb(getattr(response, "usage_metadata", None))
+    except Exception:  # noqa: BLE001 - accounting must never break compaction
+        pass
+
+
+def _generate_summary(
+    to_summarise: list[AnyMessage],
+    llm,
+    prior_summary: str = "",
+    max_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+    usage_cb=None,
+) -> str:
+    """Call the LLM once to summarise ``to_summarise``; fall back gracefully.
+
+    If ``prior_summary`` is given it is folded into the new summary (the caller
+    REPLACES the old summary), so the persistent prefix stays bounded.
+    """
     transcript = _serialise(to_summarise)
-    prompt = _SUMMARY_PROMPT.format(transcript=transcript)
+    prior_block = f"\nPRIOR SUMMARY (merge into the new one):\n{prior_summary}\n" if prior_summary else ""
+    prompt = _SUMMARY_PROMPT.format(
+        transcript=transcript,
+        max_words=max(50, (max_chars or DEFAULT_SUMMARY_MAX_CHARS) // 7),
+        prior_note="Merge the PRIOR SUMMARY with the conversation into ONE summary." if prior_summary else "",
+        prior_block=prior_block,
+    )
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
-        return response.content if isinstance(response.content, str) else str(response.content)
+        _report_usage(response, usage_cb)
+        text = response.content if isinstance(response.content, str) else str(response.content)
+        return _clip_summary(text, max_chars)
     except Exception as exc:  # noqa: BLE001
-        return (
+        note = (
             f"[Compaction failed: {exc}] "
             f"Earlier conversation ({len(to_summarise)} messages) was summarised "
             "but the summary could not be generated. Continuing from recent context."
         )
+        return _clip_summary((prior_summary + "\n\n" if prior_summary else "") + note, max_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +462,9 @@ def summarize_prefix(
     keep_recent_chars: int,
     image_token_cost: int = 2048,
     keep_recent_images: int = 5,
+    prior_summary: str = "",
+    max_summary_chars: int = DEFAULT_SUMMARY_MAX_CHARS,
+    usage_cb=None,
 ) -> tuple[str, int]:
     """Summarise the old prefix of ``messages``.
 
@@ -345,13 +475,21 @@ def summarize_prefix(
     This is the incremental variant used by the agent loop: the caller persists
     ``summary_text`` in state so the leading bytes of subsequent requests stay
     stable (prompt-cache friendly), instead of re-summarising every turn.
+
+    If ``prior_summary`` is passed it is merged into the returned text, so the
+    caller should REPLACE (not append to) its stored summary.  The result is
+    capped at ``max_summary_chars``.  ``usage_cb`` receives the summary call's
+    ``usage_metadata`` (or None) for token accounting.
     """
     _, to_summarise, to_keep, cut = _split_messages(messages, keep_recent_chars)
     if not to_summarise:
         return "", 0
 
     _replace_old_images(to_keep, keep_recent_images)
-    summary_text = _generate_summary(to_summarise, llm)
+    summary_text = _generate_summary(
+        to_summarise, llm, prior_summary=prior_summary,
+        max_chars=max_summary_chars, usage_cb=usage_cb,
+    )
     return summary_text, cut
 
 

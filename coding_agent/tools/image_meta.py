@@ -24,6 +24,7 @@ from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool
 
 from .filesystem import _cap, _cfg, _root, _within
+from .srdp import _read_capped
 
 # ---------------------------------------------------------------------------
 # format detection from magic bytes (no PIL dependency for detection)
@@ -334,7 +335,7 @@ def _load_from_zip(
         with zipfile.ZipFile(str(p)) as zf:
             if entry not in zf.namelist():
                 return f"Error: '{entry}' not found in {zip_path}"
-            raw = zf.read(entry)
+            raw = _read_capped(zf, entry)
 
             if not inner_entry:
                 return raw, entry
@@ -346,7 +347,7 @@ def _load_from_zip(
                         close = [n for n in inner.namelist() if inner_entry.lower() in n.lower()]
                         hint = f"  Closest: {close[:3]}" if close else ""
                         return f"Error: '{inner_entry}' not found inside {entry}.{hint}"
-                    return inner.read(inner_entry), inner_entry
+                    return _read_capped(inner, inner_entry), inner_entry
             except zipfile.BadZipFile:
                 return f"Error: '{entry}' is not a zip — cannot use inner_entry"
 

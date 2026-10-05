@@ -36,6 +36,7 @@ from langchain_core.runnables.config import RunnableConfig
 from langchain_core.tools import tool
 
 from .filesystem import _cfg, _root, _within
+from .srdp import _read_capped
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ from .filesystem import _cfg, _root, _within
 # ---------------------------------------------------------------------------
 
 def _read_text(zf: zipfile.ZipFile, name: str) -> str:
-    return zf.read(name).decode("utf-8", errors="replace")
+    return _read_capped(zf, name).decode("utf-8", errors="replace")
 
 
 def _parse_rels(rels_xml: str, rel_type_suffix: str) -> dict[str, str]:
@@ -149,7 +150,7 @@ def _analyse(srdp_path: Path) -> dict[str, Any]:
         name_to_positions: dict[str, set[int]] = {}  # sc_name → {slide positions}
 
         for pptx_entry in pptx_entries:
-            raw = srdp.read(pptx_entry)
+            raw = _read_capped(srdp, pptx_entry)
             with zipfile.ZipFile(io.BytesIO(raw)) as pptx:
                 pos_map = _slide_position_map(pptx)
 
@@ -245,7 +246,7 @@ def _analyse(srdp_path: Path) -> dict[str, Any]:
             "MainLiveDoc.pptx" if "MainLiveDoc.pptx" in names else None
         )
         if inst_entry:
-            raw = srdp.read(inst_entry)
+            raw = _read_capped(srdp, inst_entry)
             with zipfile.ZipFile(io.BytesIO(raw)) as pptx:
                 prs = _read_text(pptx, "ppt/presentation.xml")
                 total_slides = len(re.findall(r"<p:sldId\b", prs))

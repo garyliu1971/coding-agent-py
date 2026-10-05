@@ -60,3 +60,20 @@ def test_cap_preserves_head_and_tail():
     assert "_TAIL" in out          # tail is preserved (head-only truncation would drop it)
     assert "truncated" in out
     assert len(out) < len(text)
+
+
+if __name__ == "__main__":
+    import traceback
+
+    _tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
+    _failed = 0
+    for _n, _f in _tests:
+        try:
+            _f()
+            print(f"  [PASS] {_n}")
+        except Exception:  # noqa: BLE001
+            _failed += 1
+            print(f"  [FAIL] {_n}")
+            traceback.print_exc()
+    print("\n== RESULT: %d passed, %d failed ==" % (len(_tests) - _failed, _failed))
+    raise SystemExit(1 if _failed else 0)

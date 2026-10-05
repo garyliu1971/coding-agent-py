@@ -50,10 +50,18 @@ ALL_TOOLS = [
 ]
 
 
+_SRDP_TOOLS = (srdp_list, srdp_read, srdp_grep, srdp_map_ext_content)
+
+
 def build_tools(cfg: Config) -> list:
     tools = list(ALL_TOOLS)
+    # Optional toolsets (cfg.enable_*) keep prompt/schema overhead off plain chores.
+    if not getattr(cfg, "enable_srdp", True):
+        tools = [t for t in tools if not any(t is m for m in _SRDP_TOOLS)]
+    if not getattr(cfg, "enable_vision", True):
+        tools = [t for t in tools if t is not read_image_meta]
     # Conditionally register view_image based on vision config
-    if cfg.vision != "off":
+    if cfg.vision != "off" and getattr(cfg, "enable_vision", True):
         # Register vision tools: view_image (inline pixels), describe_image (text via HTTP),
         # and get_omitted_image (recover compacted image metadata).
         try:
@@ -64,6 +72,8 @@ def build_tools(cfg: Config) -> list:
         except ValueError:
             tools.extend([view_image, describe_image, get_omitted_image])
 
+    if not getattr(cfg, "allow_shell", True):  # --no-shell / --allow-write / --propose
+        tools = [t for t in tools if t is not run_shell]
     if cfg.read_only:
         # StructuredTool defines __eq__ (so it's unhashable); compare by identity.
         return [t for t in tools if not any(t is m for m in _MODIFYING)]

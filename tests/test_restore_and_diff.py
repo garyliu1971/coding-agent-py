@@ -14,7 +14,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from coding_agent.tools.filesystem import _BAK_DIR, edit_file, restore_file, write_file
+from coding_agent.tools.filesystem import _bak_path, edit_file, restore_file, write_file
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -26,6 +26,7 @@ def _cfg(root: Path) -> dict:
             "project_root": str(root),
             "read_only": False,
             "file_read_limit": 60_000,
+            "backup_dir": str(root.parent / (root.name + "_bak")),
         }
     }
 
@@ -89,7 +90,7 @@ def test_multi_edit_diff_shows_both_hunks(tmp_path):
 def test_edit_creates_backup(tmp_path):
     _write(tmp_path, "d.py", "original\n")
     _invoke_edit(tmp_path, "d.py", [{"old_string": "original", "new_string": "changed"}])
-    bak = tmp_path / _BAK_DIR / "d.py.bak"
+    bak = _bak_path(tmp_path.resolve(), "d.py", _cfg(tmp_path))
     assert bak.is_file(), "Backup should be created by edit_file"
     assert bak.read_text() == "original\n"
 
@@ -97,7 +98,7 @@ def test_edit_creates_backup(tmp_path):
 def test_write_file_creates_backup_on_overwrite(tmp_path):
     _write(tmp_path, "e.py", "v1\n")
     _invoke_write(tmp_path, "e.py", "v2\n")
-    bak = tmp_path / _BAK_DIR / "e.py.bak"
+    bak = _bak_path(tmp_path.resolve(), "e.py", _cfg(tmp_path))
     assert bak.is_file()
     assert bak.read_text() == "v1\n"
 
@@ -105,7 +106,7 @@ def test_write_file_creates_backup_on_overwrite(tmp_path):
 def test_write_file_no_backup_on_create(tmp_path):
     """New files have nothing to back up."""
     _invoke_write(tmp_path, "new.py", "hello\n")
-    bak = tmp_path / _BAK_DIR / "new.py.bak"
+    bak = _bak_path(tmp_path.resolve(), "new.py", _cfg(tmp_path))
     assert not bak.exists(), "No backup expected for brand-new file"
 
 
@@ -158,11 +159,10 @@ def test_restore_nonexistent_file_gives_error(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_no_backup_when_edit_fails_validation(tmp_path):
-    """If old_string is not found, we abort before writing — backup should
-    still be created (we backup eagerly before validation so the slot is
-    ready), but the file itself must be unchanged."""
+    """If validation fails nothing is written and NO backup is taken."""
     _write(tmp_path, "j.py", "x = 1\n")
     out = _invoke_edit(tmp_path, "j.py", [{"old_string": "NOTEXIST", "new_string": "y = 2"}])
     assert "Error" in out
     # File must be unchanged
     assert (tmp_path / "j.py").read_text() == "x = 1\n"
+    assert not _bak_path(tmp_path.resolve(), "j.py", _cfg(tmp_path)).exists()

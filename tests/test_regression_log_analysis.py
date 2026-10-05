@@ -67,7 +67,7 @@ class _Bound:
 
 
 class _LLM:
-    def bind_tools(self, tools):
+    def bind_tools(self, tools, **kwargs):
         return _Bound([t.name for t in tools])
 
     def invoke(self, messages):
@@ -87,6 +87,7 @@ def test_time_budget() -> None:
     }
     final = graph.invoke(state, config={"recursion_limit": 20, **tcfg(tmp)})
     check("finished via finish-only model", final.get("finished") is True and final.get("final_summary") == "forced", str(final.get("final_summary")))
+    check("stop_reason is time_budget", final.get("stop_reason") == "time_budget", str(final.get("stop_reason")))
 
 
 def test_live_gatekeeper() -> None:

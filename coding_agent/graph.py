@@ -13,17 +13,25 @@ Key stability mechanisms for 100+ turn tasks
    `trim_messages` can produce (API error when a ToolMessage has no matching
    AIMessage tool_call in the context).
 
-2. **Correct recursion_limit**: `max_iterations * 2 + 20` — each agent→tools
-   hop consumes 2 LangGraph node transitions, so the old formula
-   `max_iterations + 10` only allowed ~half the expected tool calls.
+2. **Old tool-result stubbing**: the LLM sees old ToolMessages as one-line
+   stubs (see compaction.stub_old_tool_results); graph state keeps the originals.
+   The boundary advances in batches so the prompt-cache prefix stays stable.
 
-3. **Wind-down on stall, not total**: instead of a global total-call counter
-   (which fires too early on long tasks), we detect a STALL — N consecutive
-   tool calls with no write/edit/shell action — and only then force wind-down.
-   Long, legitimate tasks that keep making progress are never cut short.
+3. **Budgets with finish-only wind-down**: tokens (cfg.max_total_tokens, at 80%),
+   wall-clock (cfg.run_timeout_sec) and steps (cfg.max_iterations; the last model
+   call is finish-only, so the LangGraph recursion limit is never reached).  A
+   wind-down turn binds only `finish` and appends a SystemMessage saying so
+   (the only place the model is told about budgets - no per-turn overhead).
+   Any non-`finish` reply during wind-down ends the run.
 
-4. **Loop guard** (unchanged): detects identical-args repeats and
-   exploration-only stalls, strips exploration tools and injects a warning.
+4. **Wind-down on stall, not total**: N consecutive tool calls with no
+   write/edit/shell action (cfg.stall_threshold) force wind-down.  Not applied in
+   read-only mode, where reading IS the work (budgets + loop guard still apply).
+
+5. **Loop guard**: detects identical-args repeats and exploration-only stalls,
+   strips exploration tools and injects a warning.
+
+6. **Run result**: `stop_reason` and `usage` in the final state (see state.py).
 """
 from __future__ import annotations
 
@@ -36,7 +44,7 @@ from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMe
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from .compaction import count_chars, summarize_prefix
+from .compaction import count_chars, stub_old_tool_results, summarize_prefix
 from .config import Config
 from .llm import build_llm
 from .state import AgentState
@@ -122,6 +130,44 @@ def _loop_warning(
         )
     return None
 
+_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens", "llm_calls", "steps")
+_TOKEN_WIND_DOWN_FRACTION = 0.8
+
+
+def _new_usage(prev: dict | None) -> dict:
+    usage = {k: 0 for k in _USAGE_KEYS}
+    for k, v in (prev or {}).items():
+        if k in usage and isinstance(v, int):
+            usage[k] = v
+    return usage
+
+
+def _add_usage(usage: dict, um: dict | None) -> None:
+    """Fold one model call's usage_metadata into ``usage`` (in place)."""
+    usage["llm_calls"] += 1
+    if not um:
+        return
+    i = int(um.get("input_tokens") or 0)
+    o = int(um.get("output_tokens") or 0)
+    usage["input_tokens"] += i
+    usage["output_tokens"] += o
+    usage["total_tokens"] += int(um.get("total_tokens") or (i + o))
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, str):
+                parts.append(b)
+            elif isinstance(b, dict) and b.get("type") == "text":
+                parts.append(str(b.get("text") or ""))
+        return "".join(parts)
+    return ""
+
+
 
 # ---------------------------------------------------------------------------
 # graph nodes
@@ -138,6 +184,7 @@ def _agent_node(cfg: Config, llm_plain, model_full, model_no_explore, model_only
         if run_start["t"] is None or not any(isinstance(m, AIMessage) for m in messages):
             run_start["t"] = time.monotonic()
         elapsed = time.monotonic() - run_start["t"]
+        usage = _new_usage(state.get("usage"))
 
         # --- Stable-prefix context assembly (prompt-cache friendly) ---
         # Leading SystemMessages are the system prompt.  Messages up to
@@ -149,7 +196,10 @@ def _agent_node(cfg: Config, llm_plain, model_full, model_no_explore, model_only
             system_msgs.append(messages[i])
             i += 1
 
-        active = messages[compacted_count:] if compacted_count else messages
+        # `active` never includes the leading system messages (they are added
+        # back by _assemble; including them here sent the system prompt twice).
+        active_start = max(compacted_count, len(system_msgs))
+        active = messages[active_start:]
 
         def _assemble(summary_text: str, active_msgs: list[AnyMessage]) -> list[AnyMessage]:
             out = list(system_msgs)
@@ -159,49 +209,83 @@ def _agent_node(cfg: Config, llm_plain, model_full, model_no_explore, model_only
                         f"[CONTEXT SUMMARY — earlier conversation compressed]\n\n{summary_text}"
                     )
                 )
-            out.extend(active_msgs)
+            # LLM-only view: old tool results become one-line stubs; state is untouched.
+            out.extend(
+                stub_old_tool_results(active_msgs, cfg.stub_after_rounds, cfg.stub_batch_rounds)
+            )
             return out
 
         llm_messages = _assemble(summary, active)
 
         # --- Incremental compaction ---
-        # Summarise the old prefix of `active` only when it grows past the
-        # budget.  The summary is persisted in state (returned below), so the
-        # next turn reuses it — keeping the leading bytes stable for KV cache.
+        # Summarise the old prefix of `active` only when the (stubbed) LLM view
+        # grows past the budget.  The summary is persisted in state (returned
+        # below) and RE-summarised with the new span, so it stays bounded and the
+        # next turn reuses it - keeping the leading bytes stable for KV cache.
         new_summary = summary
         new_count = compacted_count
-        if count_chars(active, image_token_cost=cfg.vision_image_token_cost) > cfg.context_budget_chars:
+        view_chars = count_chars(llm_messages, image_token_cost=cfg.vision_image_token_cost)
+        if view_chars > cfg.context_budget_chars:
+            def _compaction_usage(um):
+                _add_usage(usage, um)
+
             summary_text, cut_abs = summarize_prefix(
                 active,
                 llm=llm_plain,
                 keep_recent_chars=cfg.keep_recent_chars,
                 image_token_cost=cfg.vision_image_token_cost,
                 keep_recent_images=cfg.vision_keep_recent,
+                prior_summary=summary,
+                max_summary_chars=cfg.summary_max_chars,
+                usage_cb=_compaction_usage,
             )
             if summary_text and cut_abs > 0:
-                new_summary = (summary + "\n\n" if summary else "") + summary_text
-                new_count = compacted_count + cut_abs
+                new_summary = summary_text  # already merged with the prior summary
+                new_count = active_start + cut_abs
                 active = active[cut_abs:]
                 llm_messages = _assemble(new_summary, active)
 
-        # --- Wind-down: detect STALL, not total call count ---
-        # Only force wind-down when the agent has been stuck (no write/edit/
-        # shell/finish) for too many consecutive steps.  This never fires
-        # during legitimate long tasks that keep making progress.
-        stall = _stall_count(messages)
+        # --- Wind-down selection ---
+        # Budget wind-downs (time / tokens / steps) and the stall rule force a
+        # finish-only turn.  The stall rule counts consecutive calls with no
+        # write/shell action; it is skipped in read-only mode, where reading is
+        # the work (budgets, loop guard and the finish-early rule still apply).
+        step_no = usage["steps"] + 1
         warning = _loop_warning(messages)
-
-        wind_down_stall_threshold = 12  # consecutive no-progress tool calls → wind-down
-
+        wind_down = ""
+        wind_msg = ""
         if elapsed > cfg.run_timeout_sec:
+            wind_down = "time_budget"
+            wind_msg = (
+                f"[time budget] {int(elapsed)}s elapsed (limit {cfg.run_timeout_sec}s). "
+                "Stop now and call `finish` with your findings so far, and state what is unverified. Only `finish` is available."
+            )
+        elif cfg.max_total_tokens > 0 and usage["total_tokens"] >= _TOKEN_WIND_DOWN_FRACTION * cfg.max_total_tokens:
+            wind_down = "token_budget"
+            wind_msg = (
+                f"[token budget] {usage['total_tokens']} of {cfg.max_total_tokens} tokens used. "
+                "You must call `finish` NOW with what you have, and state what is unverified. Only `finish` is available."
+            )
+        elif step_no >= cfg.max_iterations:
+            wind_down = "max_steps"
+            wind_msg = (
+                f"[step budget] step {step_no} of {cfg.max_iterations}. "
+                "You must call `finish` NOW with what you have, and state what is unverified. Only `finish` is available."
+            )
+        elif warning:
+            pass
+        elif not cfg.read_only and _stall_count(messages) >= cfg.stall_threshold:
+            wind_down = "stalled"
+            wind_msg = (
+                f"[wind-down] You have made {_stall_count(messages)} consecutive tool calls with no "
+                "file writes, edits, or shell commands — this looks like a stall. "
+                "STOP reading/exploring. Either make the required changes now or "
+                "call `finish` with your findings. Only `finish` is available."
+            )
+
+        if wind_down:
             model = model_only_finish
-            llm_messages = [
-                *llm_messages,
-                SystemMessage(
-                    f"[time budget] {int(elapsed)}s elapsed (limit {cfg.run_timeout_sec}s). "
-                    "Stop now and call `finish` with your findings so far, and state what is unverified. Only `finish` is available."
-                ),
-            ]
+            llm_messages = [*llm_messages, SystemMessage(wind_msg)]
         elif warning:
             model = model_no_explore
             llm_messages = [
@@ -213,23 +297,12 @@ def _agent_node(cfg: Config, llm_plain, model_full, model_no_explore, model_only
                     "run_shell, edit/write files, or call finish."
                 ),
             ]
-        elif stall >= wind_down_stall_threshold:
-            model = model_only_finish
-            llm_messages = [
-                *llm_messages,
-                SystemMessage(
-                    f"[wind-down] You have made {stall} consecutive tool calls with no "
-                    "file writes, edits, or shell commands — this looks like a stall. "
-                    "STOP reading/exploring. Either make the required changes now or "
-                    "call `finish` with your findings. Only `finish` is available."
-                ),
-            ]
         else:
             model = model_full
 
         # If vision is enabled, instruct the model about tool failure semantics so it
         # does not treat other tools' error strings as image understanding.
-        if cfg.vision != "off":
+        if cfg.vision != "off" and cfg.enable_vision:
             llm_messages = [
                 *llm_messages,
                 SystemMessage(
@@ -247,12 +320,24 @@ Failure to follow these rules will be treated as incorrect. Use only the injecte
                 ),
             ]
 
-        resp = model.invoke(llm_messages)
+        try:
+            resp = model.invoke(llm_messages)
+        except Exception as exc:
+            # Keep what this step already spent (compaction calls) so a failed run
+            # does not under-report usage; cli.run_agent merges it into RunFailed.final.
+            usage["steps"] += 1
+            try:
+                exc.partial_usage = usage
+            except Exception:
+                pass
+            raise
         um = getattr(resp, "usage_metadata", None)
+        _add_usage(usage, um)
+        usage["steps"] += 1
         if um:
             logging.getLogger("coding_agent.usage").info(
                 "llm usage in=%s out=%s total=%s", um.get("input_tokens"), um.get("output_tokens"), um.get("total_tokens"))
-        result = {"messages": [resp]}
+        result = {"messages": [resp], "usage": usage, "wind_down": wind_down}
         if new_summary != summary or new_count != compacted_count:
             result["summary"] = new_summary
             result["compacted_count"] = new_count
@@ -264,6 +349,10 @@ Failure to follow these rules will be treated as incorrect. Use only the injecte
 def _route_after_agent(state: AgentState) -> str:
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and last.tool_calls:
+        # During a finish-only wind-down anything but `finish` ends the run
+        # (the tool would not even exist), so a budget can never be overrun.
+        if state.get("wind_down") and not any(tc.get("name") == "finish" for tc in last.tool_calls):
+            return "finalize"
         return "tools"
     return "finalize"
 
@@ -327,13 +416,30 @@ def _route_after_tools(state: AgentState) -> str:
 
 
 def _finalize(state: AgentState) -> dict:
-    result: dict = {"finished": True, "final_summary": ""}
-    for m in state["messages"]:
-        if isinstance(m, AIMessage) and m.tool_calls:
-            for tc in m.tool_calls:
-                if tc.get("name") == "finish":
-                    result["final_summary"] = (tc.get("args") or {}).get("summary", "")
-    return result
+    """Set final_summary / stop_reason (see state.py 'Run result contract')."""
+    wind_down = state.get("wind_down") or ""
+    last_ai = next((m for m in reversed(state["messages"]) if isinstance(m, AIMessage)), None)
+    summary = ""
+    finish_called = False
+    if last_ai is not None:
+        for tc in last_ai.tool_calls or []:
+            if tc.get("name") == "finish":
+                finish_called = True
+                summary = str((tc.get("args") or {}).get("summary", "") or "")
+        if not finish_called and not last_ai.tool_calls:
+            summary = _text_of(last_ai.content).strip()  # soft finish: plain-text answer
+
+    if wind_down in ("token_budget", "time_budget", "max_steps"):
+        stop_reason = wind_down
+    elif finish_called:
+        stop_reason = "finished"
+    elif wind_down == "stalled":
+        stop_reason = "stalled"
+    elif summary:
+        stop_reason = "soft_finished"  # complete plain-text answer, just no `finish` call
+    else:
+        stop_reason = "no_final_answer"
+    return {"finished": True, "final_summary": summary, "stop_reason": stop_reason}
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,38 @@ def _parse_opt_int(v):
     return int(v) if v and v.strip() else None
 
 
+def _env_int(name: str, default: int) -> int:
+    """Int from env var ``name``; blank / invalid values fall back to ``default``."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+# Keyword triggers for auto-enabling the optional SRDP / vision toolsets.
+_SRDP_RE = re.compile(r"srdp|\.zip", re.I)
+# Letters-only boundaries so "configure" does not match "figure".
+_VISION_RE = re.compile(
+    r"(?<![a-z])(?:image|png|jpg|jpeg|screenshot|vision|picture|figure)s?(?![a-z])", re.I
+)
+
+
+def detect_toolset(task_text: str) -> dict:
+    """Decide which optional toolsets a task needs, from its text.
+
+    SRDP tools: task mentions srdp / .zip / .srdp.  Vision tools: task mentions
+    image, png, jpg, jpeg, screenshot, vision, picture or figure.
+    """
+    text = task_text or ""
+    return {
+        "enable_srdp": bool(_SRDP_RE.search(text)),
+        "enable_vision": bool(_VISION_RE.search(text)),
+    }
+
+
 @dataclass
 class Config:
     """Runtime configuration for the coding agent."""
@@ -46,18 +79,29 @@ class Config:
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
     temperature: float | None = 0.0   # None = omit (some GPT-5 deployments reject non-default values)
-    max_iterations: int = 200          # max agent loop steps (each tool call ≈ 1 step;
-                                       # 100-turn tasks need 150+ headroom)
-    wind_down_steps: int = 180         # tool calls before forced wind-down
-                                       # (set close to max_iterations so it only
-                                       # fires at the very end, not mid-task)
+    max_iterations: int = 40           # max model calls; the last one is finish-only
+                                       # (sub-agent default; raise via --iterations / env)
+    max_total_tokens: int = 250_000    # input+output tokens per run; 0 = unlimited.
+                                       # At >=80% only `finish` is offered.
+    stall_threshold: int = 12          # consecutive no-write/shell tool calls -> wind-down
+                                       # (ignored in read-only mode)
     run_timeout_sec: int = 600        # wall-clock budget; after this only `finish` is offered
     request_timeout_sec: int = 120    # per model call
     max_completion_tokens: int | None = None  # cap per-call output (incl. reasoning); None = provider default
     reasoning_effort: str | None = None       # gpt-5 family: minimal|low|medium|high; None = provider default
     max_retries: int = 6              # SDK retries 429/5xx with backoff, honoring Retry-After
-    context_budget_chars: int = 120_000  # trigger compaction when history exceeds this
-    keep_recent_chars: int = 40_000      # chars of recent context to keep un-summarised
+    context_budget_chars: int = 50_000   # trigger compaction when the LLM view exceeds this
+    keep_recent_chars: int = 15_000      # chars of recent context to keep un-summarised
+    summary_max_chars: int = 3_000       # hard cap on the (re-summarised) compaction summary
+    stub_after_rounds: int = 4           # tool results older than this many assistant rounds
+                                         # are replaced by one-line stubs in the LLM view (0 = off)
+    stub_batch_rounds: int = 4           # stub boundary advances in batches of this many rounds
+                                         # (keeps the prompt-cache prefix stable between batches)
+
+    # Optional toolsets (plus their prompt text). Defaults keep old behaviour;
+    # the CLI can switch them off / auto-detect them via detect_toolset().
+    enable_srdp: bool = True
+    enable_vision: bool = True           # also requires vision != "off" for view/describe tools
 
     # Vision / image handling (default: off)
     vision: str = "off"  # one of 'off'|'auto'|'on'
@@ -76,8 +120,8 @@ class Config:
     allow_shell: bool = True
     allow_dangerous_commands: bool = False  # allow disaster-level shell commands (rm -rf /, format, shutdown, sudo, ...)
     shell_timeout: int = 120          # seconds
-    tool_output_limit: int = 20_000   # cap chars returned by run_shell
-    file_read_limit: int = 60_000     # cap chars returned by read_file
+    tool_output_limit: int = 12_000   # cap chars returned by run_shell / grep_search
+    file_read_limit: int = 20_000     # cap chars returned by read_file
     project_root: Path = field(default_factory=Path.cwd)
 
     @classmethod
@@ -96,6 +140,11 @@ class Config:
             temperature=_parse_temperature(os.getenv("CODING_AGENT_TEMPERATURE")),
             max_completion_tokens=_parse_opt_int(os.getenv("CODING_AGENT_MAX_COMPLETION_TOKENS")),
             reasoning_effort=(os.getenv("CODING_AGENT_REASONING_EFFORT") or None),
+            max_total_tokens=_env_int("CODING_AGENT_MAX_TOTAL_TOKENS", cls.max_total_tokens),
+            max_iterations=_env_int("CODING_AGENT_MAX_ITERATIONS", cls.max_iterations),
+            run_timeout_sec=_env_int("CODING_AGENT_RUN_TIMEOUT_SEC", cls.run_timeout_sec),
+            stub_after_rounds=_env_int("CODING_AGENT_STUB_AFTER_ROUNDS", cls.stub_after_rounds),
+            stall_threshold=_env_int("CODING_AGENT_STALL_THRESHOLD", cls.stall_threshold),
             read_only=os.getenv("CODING_AGENT_READ_ONLY", "0").lower() in ("1", "true", "yes"),
             allow_dangerous_commands=os.getenv("CODING_AGENT_ALLOW_DANGEROUS", "0").lower() in ("1", "true", "yes"),
             project_root=Path(os.getenv("CODING_AGENT_ROOT", Path.cwd())),

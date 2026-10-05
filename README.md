@@ -83,8 +83,75 @@ coding-agent --root . --gpt5-mini run "给 utils.py 加一个单元测试"
 | `--api-key KEY` | 覆盖 API key（本地 Ollama 留空） |
 | `--read-only` | 只读：禁用写文件 / Shell |
 | `--gpt5-mini` | 用 gpt-5-mini（Azure Foundry）作为主 LLM，替代 DeepSeek；需在 `.env` 配好 `CODING_AGENT_VISION_MODEL_URL` / `_NAME` / `_API_KEY` |
-| `--iterations N` | agent 最大循环步数（默认 200） |
+| `--iterations N` | agent 最大循环步数（默认 40；最后一步只允许 `finish`） |
 | `--vision on/off/auto` | 开启图片识别工具（默认 off） |
+
+### `run` 子命令参数（子 agent 用法）
+
+| 参数 | 说明 |
+|------|------|
+| `TASK...` / `--task-file FILE` | 任务文本；`--task-file`（UTF-8，`-` 表示 stdin）适合多行/带引号/中文的任务；两者同时给出会报错（退出码 2）。单独一个 `-` 也表示读 stdin |
+| `--output FILE` | 最终答案（UTF-8 markdown），**永不为空**：没有答案时写一行说明（含 stop_reason）；`--propose` 时末尾追加 `## Proposed diff` |
+| `--json-result FILE` | 机器可读结果（见下），UTF-8 无 BOM；启动失败（退出码 2）时也会写 |
+| `--quiet` / `-q` | 不输出实时过程，只打印一行开始信息和最后一行 `status=... stop=... tokens=... files=N`；完整过程仍在 session log |
+| `--max-tokens N` | token 预算（输入+输出，默认 250000，0 = 不限）。达到 80% 后只允许 `finish`。这是**软上限**：检查发生在每次模型调用之前，最后一次调用仍可能超出（小预算下可超几十个百分点），不是硬性截断 |
+| `--timeout SEC` | 墙钟预算（默认 600 秒），超时后强制收尾 |
+| `--allow-write GLOB` | 可重复；只允许写/改/删/移动匹配的路径（相对 `--root`，如 `src/**/*.py`）。也可用环境变量 `CODING_AGENT_ALLOW_WRITE`（`;` 分隔）。越界时工具返回 `Error: path not allowed by --allow-write`。**设置后自动禁用 `run_shell`**（shell 不受 glob 约束）；目录不能被移动 |
+| `--no-shell` | 禁用 `run_shell`（编辑工具保留；`run_diagnostics` 仍可用；只读模式下它只做内存语法检查和冲突标记扫描，不跑 ruff/mypy/git）。`--allow-write` 与 `--propose` 隐含此项 |
+| `--propose` | 在 `--root` 的临时副本上运行，不改原目录，结果里带 unified diff（`.git`/`node_modules`/`__pycache__`/`.venv`/`.env*`/符号链接与 junction 不复制；自动禁用 `run_shell`；超过 50 MB 或 5000 个文件则拒绝，退出码 2）。副本里没有 `.git` |
+| `--tools auto\|all\|core` | 可选工具集：`auto`（默认）按任务文本决定是否启用 SRDP/视觉工具；`all` 全开；`core` 全关 |
+
+### 退出码
+
+| 码 | 含义 |
+|----|------|
+| 0 | `finished`（调用了 `finish`）或 `soft_finished`（以纯文本给出答案但没调用 `finish`） |
+| 2 | 用法/配置错误（缺任务、无 API key、`--propose` 过大等） |
+| 3 | 未完成：`token_budget` / `time_budget` / `max_steps` / `stalled` / `no_final_answer`（答案可能不完整） |
+| 4 | 启动之后的意外失败（异常，如 API 错误） |
+| 130 | 被中断 |
+
+### Run result JSON（`--json-result`）
+
+```json
+{
+  "status": "ok | incomplete | failed",
+  "stop_reason": "finished | soft_finished | token_budget | time_budget | max_steps | stalled | no_final_answer | error",
+  "answer": "最终答案文本",
+  "files_changed": [{"path": "src/a.py", "action": "created|modified|deleted|moved", "from": "仅 moved"}],
+  "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "llm_calls": 0, "steps": 0, "wall_seconds": 0.0},
+  "model": "gpt-5-mini",
+  "root": "C:\\project",
+  "read_only": false,
+  "session_log": "C:\\coding-agent\\logs\\session_123.log",
+  "warnings": ["..."],
+  "error": null,
+  "diff": "仅 --propose 时出现的 unified diff"
+}
+```
+
+`status` 为 `ok` 当且仅当 `stop_reason` 是 `finished` 或 `soft_finished`；`files_changed` 只统计**执行成功**的 write/edit/delete/move 调用（路径相对 `--root`，已被撤销的新建文件不计），**不含** `run_shell` 造成的改动（用过 shell 时 `warnings` 会提示）。
+
+## 作为子 agent 使用（Using as a sub-agent）
+
+调用方（如 Claude Code）只需看退出码和 JSON，不必解析终端输出：
+
+```bash
+# 1) 只读分析：小输入的总结 / 日志分析，不允许改动
+coding-agent --root C:\proj --read-only run --quiet --json-result r.json --output r.md \
+  --task-file task.md --max-tokens 100000
+
+# 2) 受限的小改动：只能改 src 下的 .py，不允许 shell
+coding-agent --root C:\proj run --quiet --json-result r.json \
+  --allow-write "src/**/*.py" --no-shell "把 utils.py 里的 foo 重命名为 bar 并更新调用处"
+
+# 3) 先看补丁再决定：在副本上改，diff 在 r.json 的 "diff" 和 r.md 的 "## Proposed diff"
+coding-agent --root C:\proj run --propose --quiet --json-result r.json --output r.md \
+  --task-file task.md
+echo "exit=$?"   # 0 完成 / 3 未完成（看 stop_reason）/ 4 失败 / 2 用法错误
+```
+
+建议：先 `git status` 确认工作区干净，运行后用 `git diff` 复核；`--read-only` 是唯一强保证（`run_shell` 的危险命令拦截只是减速带）；备份在系统临时目录 `%TEMP%\coding-agent-bak`（不在项目内）。
 
 ## 工具清单
 
@@ -165,6 +232,7 @@ coding-agent/
 │   └── visprobe.py                  # 单次视觉探测（调试用）
 └── coding_agent/
     ├── cli.py          # 命令行入口（analyze / run / chat）
+    ├── result.py       # 运行结果 JSON / --propose 副本与 diff / 任务输入（纯函数）
     ├── config.py       # 配置（环境变量 + CLI 覆盖）
     ├── state.py        # LangGraph 状态类型
     ├── prompts.py      # 各模式的系统提示词
@@ -187,7 +255,7 @@ coding-agent/
 
 - **换主模型**：设 `.env` 里的 `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` / `DEEPSEEK_API_KEY`。
 - **换视觉模型**：设 `CODING_AGENT_VISION_MODEL_URL` / `CODING_AGENT_VISION_MODEL_NAME`，参见上方视觉配置。
-- **调整上下文预算**：`Config.context_budget_chars`（默认 120k 字符）。
+- **调整上下文预算**：`Config.context_budget_chars`（默认 50k 字符）。
 - **加新工具**：在 `tools/` 下写 `@tool` 函数，加入 `tools/__init__.py` 的 `ALL_TOOLS`。
 
 ## 已知限制 / 后续方向
